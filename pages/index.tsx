@@ -1,13 +1,11 @@
 import Link from '@/components/Link'
 import { PageSEO } from '@/components/SEO'
-import Tag from '@/components/Tag'
 import siteMetadata from '@/data/siteMetadata'
 import { getAllFilesFrontMatter } from '@/lib/mdx'
 import formatDate from '@/lib/utils/formatDate'
 import { GetStaticProps, InferGetStaticPropsType } from 'next'
 import { PostFrontMatter } from 'types/PostFrontMatter'
 import NewsletterForm from '@/components/NewsletterForm'
-import { logEvent } from '@/components/analytics/GoogleAnalytics'
 
 const MAX_DISPLAY = 5
 
@@ -24,8 +22,9 @@ export default function Home({ posts }: InferGetStaticPropsType<typeof getStatic
       <div className="divide-y divide-gray-200 dark:divide-gray-700">
         <div className="space-y-2 pt-3 pb-6 md:space-y-4">
           <p className="leading-7 text-gray-600 dark:text-gray-300">
-            Ben Piggin is a software engineer who lives in London. Sometimes he writes blog
-            articles. You can find them here.
+            Aashish Dhakal is a passionate software engineer who emphasizes creating clean,
+            optimized, and thoroughly tested software. Occasionally, he shares his thoughts in blog
+            posts, you can check them out.
           </p>
         </div>
         <ul className="divide-y divide-gray-200 dark:divide-gray-700">

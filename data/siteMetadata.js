@@ -1,22 +1,22 @@
 const siteMetadata = {
-  title: 'Ben Piggin',
-  author: 'Ben Piggin',
-  headerTitle: 'Ben Piggin',
+  title: 'Aashish Dhakal',
+  author: 'Aashish Dhakal',
+  headerTitle: 'Aashish Dhakal',
   description:
-    'Ben Piggin is a software engineer who lives in London. Sometimes he writes blog articles. You can find them here.',
+    'Aashish Dhakal is an experienced software engineer who has helped startups and enterprises streamline their processes by managing infrastructure and designing robust software solutions. Occasionally, he shares his thoughts in blog posts—you can check them out.',
   language: 'en-gb',
   theme: 'light', // system, dark or light
-  siteUrl: 'https://bpiggin.com',
-  siteRepo: 'https://github.com/bpiggin/bpiggin-blog',
-  siteLogo: '/static/images/logo.png',
-  image: '/static/images/avatar.png',
-  socialBanner: '/static/images/twitter-card.png',
+  siteUrl: 'https://aashish-dhakal.com.np',
+  siteRepo: 'https://github.com/aasisdhakal/personal-blog',
+  siteLogo: '/static/images/logo.svg',
+  image: '/static/images/logo.svg',
+  socialBanner: '/static/images/logo.svg',
   email: 'benp@theodo.co.uk',
-  github: 'https://github.com/bpiggin',
+  github: 'https://github.com/aasisdhakal',
   twitter: '',
   facebook: '',
   youtube: '',
-  linkedin: 'https://www.linkedin.com/in/benjamin-piggin',
+  linkedin: 'https://www.linkedin.com/in/aashish-dhakal504/',
   locale: 'en-GB',
   analytics: {
     // If you want to use an analytics provider you have to add it to the

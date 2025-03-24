@@ -8,7 +8,7 @@ export default function Projects() {
     <>
       <PageSEO title={`Projects - ${siteMetadata.author}`} description="Things I have built" />
       {projectsData.map((project) => (
-        <div key={project.title} className="flex w-full flex-col items-center md:flex-row">
+        <div key={project.title} className="mt-5 flex w-full flex-col items-center md:flex-row">
           <div className="w-full">
             <p>{project.title}</p>
             <p className="text-sm text-primary-600 dark:text-primary-400">{project.description}</p>
