@@ -1,4 +1,3 @@
-import { logEvent } from '@/components/analytics/GoogleAnalytics'
 import Image from '@/components/Image'
 import { PageSEO } from '@/components/SEO'
 import { ReactNode } from 'react'
@@ -27,15 +26,14 @@ export default function AuthorLayout({ frontMatter }: Props) {
             />
           </div>
           <div className="prose max-w-none pt-8 pb-8 dark:prose-dark xl:col-span-2">
-            Hey, I'm Ben. 👋
+            Hi, I’m Aashish Dhakal. 👋
             <br />
             <br />
-            I have a Masters in Physics from Oxford University. I have experience across the full
-            stack and entire software development lifecycle. I've delivered high-quality, scalable
-            products to production and hope to continue doing so!
-            <br />
-            <br /> I'm a qualified AWS Developer Associate and Cloud Practitioner. I'm also a
-            qualified Circl Leader as a Coach.
+            Product Minded Software Engineer and DevOps specialist. I focus on building scalable,
+            cloud-native solutions—from microservices to CI/CD pipelines. With over 7 years of
+            experience, I’ve helped teams boost performance and agility across startups and
+            established companies. In my free time, I enjoy hiking, playing guitar, and watching the
+            sunset.
           </div>
         </div>
       </div>

@@ -1,0 +1,151 @@
+---
+title: Keep Your K8s Cluster Healthy with Real-time Monitoring by Prometheus & AlertManager
+date: '2024-01-15'
+tags: ['Prometheus', 'Monitoring And Observability', 'Kubernetes', 'Devops']
+draft: false
+summary: Prometheus helps keep your Kubernetes cluster healthy by continuously monitoring key metrics and providing insights into performance. By integrating AlertManager, you can receive real-time notifications for critical issues, ensuring proactive management. This guide covers the steps to install and configure Prometheus with Slack notifications for seamless monitoring.
+images: []
+layout: PostSimple
+---
+
+Maintaining a healthy Kubernetes (K8s) cluster is akin to caring for a garden. You nurture it, watch it grow, and ensure it thrives. Similar to tending to a garden’s needs, a K8s cluster demands attention and care. **Prometheus**, an open-source toolkit, acts as a vigilant caretaker for your K8s environment.
+
+Just like a garden can suffer if pests aren’t kept in check, your Kubernetes cluster might encounter challenges such as **resource constraints**, **network issues**, **scheduling problems**, or **storage issues**—all silently brewing disruptions that could potentially impact your business, all while remaining undetected.
+
+---
+
+## 🌟 What is Prometheus and Why Use It?
+
+Prometheus functions like a watchful guardian, continuously collecting data (**metrics**) from your cluster’s various elements such as **nodes**, **pods**, and **services**. It stores this data in its own database, ready for analysis, visualization, and alerting.
+
+Think of it as a **comprehensive report** on your K8s cluster’s condition. It allows you to track:
+
+- CPU and memory usage
+- Network traffic
+- Request latency
+- And more...
+
+### 🛠 Prometheus helps you:
+
+- Spot potential issues early (e.g., Resource Utilization, Network Congestion, Persistent Errors)
+- Understand your cluster’s performance and resource usage
+- Make informed decisions about scaling and optimization
+- Receive timely alerts via Slack or other channels for critical issues
+
+---
+
+## ⚙️ How Does Prometheus Work?
+
+Prometheus uses a **pull-based model**, retrieving metrics through HTTP endpoints from:
+
+- Kubernetes components
+- Exporters like Node Exporter & cAdvisor
+
+### 📊 Node Exporter
+
+Gathers **system-level metrics** from Kubernetes nodes (CPU, memory, disk I/O, network).
+_Analogy: The kitchen manager checking oven temps, ingredient stocks, and how busy the kitchen is._
+
+### 📦 cAdvisor (Container Advisor)
+
+Collects **container-level metrics** (CPU, memory usage, disk I/O).
+_Analogy: The sous-chef focusing on individual dishes, monitoring their progress and quality._
+
+---
+
+## 🔄 Workflow: Prometheus + AlertManager
+
+Once data is gathered, you can use **PromQL** to query it. Visualize this data using **Grafana** dashboards.
+
+Grafana acts like the **head chef’s tablet**, making everything easy to understand at a glance — metrics from Node Exporter and cAdvisor are presented in a clear, visual format.
+
+---
+
+## 🚀 Implementation Guide
+
+Let’s install Prometheus using **Helm**, the package manager for Kubernetes.
+
+### 1️⃣ Install Helm
+
+```bash
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 > get_helm.sh
+chmod 700 get_helm.sh
+./get_helm.sh
+```
+
+### 2️⃣ Add the Bitnami Chart Repository
+
+Next, we’ll add the Bitnami chart repository to Helm
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+```
+
+### 3️⃣ Create a Monitoring Namespace
+
+Next, we’ll add the Bitnami chart repository to Helm
+
+```bash
+kubectl create namespace monitoring
+```
+
+### 4️⃣ Switch to the Monitoring Namespace
+
+Switch to the newly created namespace for subsequent operations:
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+```
+
+### 5️⃣ Install Prometheus:
+
+Finally, use Helm to install the **kube-prometheus** chart, it comes with default components like node exporter, black-box exporter, and kube metrics.
+
+```bash
+helm install prometheus oci://registry-1.docker.io/bitnamicharts/kube-prometheus
+
+```
+
+## Bonus: Set Up AlertManager Slack Integration
+
+To ensure timely notifications, we’ve established predefined alert rules. When these criteria are met, alerts are routed through AlertManager to Slack for immediate attention.
+For more alerting guidelines, refer to the additional rules available [here](https://gist.githubusercontent.com/aasisdhakal/4e727a1622c94c05e81a7e70e07a728c/raw/26b5083a111d8185900701ffbe9d0f51f9073616/prometheus-rules.yaml).
+
+### Deploy the Alert Rules 🚀
+
+```bash
+curl -sL https://gist.githubusercontent.com/aasisdhakal/4e727a1622c94c05e81a7e70e07a728c/raw/26b5083a111d8185900701ffbe9d0f51f9073616/prometheus-rules.yaml \
+  | kubectl create -f -
+```
+
+### Verify the Alert Rules 🔍
+
+Initiate port forwarding and check the alert section to see the list of alerts:
+
+```bash
+kubectl port-forward --namespace monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090
+```
+
+### Update AlertManager Config 🔧
+
+1. Download the alertmanager-config.yaml file and add your Slack API key and channel name.
+
+2. Encode the file and copy the value:
+
+```bash
+base64 -w 0 alertmanager-config.yaml
+```
+
+3. Edit the Secrets and replace alertmanager.yaml value with the encoded value:
+
+```bash
+kubectl edit secret alertmanager-prometheus-kube-prometheus-alertmanager -n monitoring
+```
+
+After making these adjustments, anticipate prompt alerts. Whenever the defined rules are triggered, messages will be dispatched to the AlertManager.
+
+## Conclusion 🌱
+
+By implementing Prometheus and AlertManager, you’ve transformed your K8s cluster into a well-monitored garden, blooming with insights and proactive notifications. You can identify potential issues early, optimize resource utilization, and ensure smooth operation—all while keeping your business flourishing.
+
+Embrace the power of Prometheus and AlertManager, and watch your K8s cluster thrive!
