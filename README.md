@@ -1,5 +1,3 @@
-![tailwind-nextjs-banner](/public/static/images/twitter-card.png)
-
 ## Quick Start Guide
 
 1. JS (official support)
