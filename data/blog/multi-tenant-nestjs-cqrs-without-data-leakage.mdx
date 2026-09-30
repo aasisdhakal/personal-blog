@@ -1,0 +1,363 @@
+---
+title: 'Multi-Tenancy in NestJS CQRS Without Leaking Data Between Tenants'
+date: '2026-09-24'
+tags: ['NestJS', 'CQRS', 'Multi-Tenancy', 'PostgreSQL', 'Architecture']
+draft: true
+summary: How we kept each tenant's data in its own place in a NestJS CQRS backend, using one database per tenant and AsyncLocalStorage to carry the connection. It also covers the places where tenant context still slips out, and the test I would write on day one.
+images: []
+layout: PostSimple
+---
+
+The CRM I work on is used by agencies that compete for the same customers. Each agency keeps its contacts, deals, notes and documents in the system. If one agency ever sees another agency's pipeline, we have given a competitor its customer list.
+
+In most multi-tenant apps, the thing standing between those two agencies is a line like this:
+
+```sql
+WHERE tenant_id = $1
+```
+
+It has to be in every query, written by every developer, on every code path, forever. One missing line leaks data. Code review catches it most of the time, and "most of the time" is the problem.
+
+This post is about how we took that line out of the application entirely, how the tenant travels through a NestJS CQRS app without anyone passing it around, and where it can still slip out even after all that.
+
+<TOCInline toc={props.toc} />
+
+## Picking an isolation model
+
+We looked at four options.
+
+**One database, a `tenant_id` column on every table.** This is the cheapest to build and run: one connection pool, one migration run, one backup. Isolation depends on every query remembering the filter.
+
+**One schema per tenant inside one database.** Better separation, but a wrong `search_path` on a pooled connection still points one tenant's query at another tenant's tables. You also run migrations once per schema, so you pay most of the cost of separate databases without all of the benefit.
+
+**Postgres row-level security.** RLS moves the filter into the database, which is attractive. It needs the tenant set per session or per transaction (`SET app.tenant_id = ...`), and that sits badly with long-lived pooled connections. If a connection goes back to the pool with the wrong setting, you have the same bug, just harder to see.
+
+**One physical database per tenant, plus a small central registry.** The registry holds one row per tenant with its connection details and an encrypted password. Every other table lives in the tenant's own database.
+
+We went with the last one. The deciding argument was simple: if the connection decides the tenant, no query needs a tenant filter, so no query can forget it. The worst a missing filter can do is return too many rows from the same tenant.
+
+It is not free. Onboarding a tenant now means provisioning a database, so it runs as a queue job that creates the database, runs the tenant migrations and seeds reference data. Every schema change has to run across every tenant database. Reporting across tenants is impossible from inside the API, which for us was a feature. Shared reference data has to be copied in, and we use Postgres logical replication for that. At our size each tenant fits on a small instance, so the cost stayed reasonable.
+
+## Resolve the tenant once, at the edge
+
+Every request says which tenant it is for. A middleware reads that, looks the tenant up in the registry, and opens or reuses a connection to its database.
+
+```ts
+@Injectable()
+export class TenantMiddleware implements NestMiddleware {
+  constructor(
+    private readonly registry: TenantRegistry,
+    private readonly connections: TenantConnections
+  ) {}
+
+  async use(req: Request, _res: Response, next: NextFunction) {
+    const tenantId = req.header('x-tenant-id')
+    if (!tenantId) throw new BadRequestException('Tenant is required')
+
+    const tenant = await this.registry.findActive(tenantId)
+    if (!tenant) throw new UnauthorizedException('Unknown or inactive tenant')
+
+    const dataSource = await this.connections.get(tenant)
+    tenantStorage.run({ tenantId: tenant.id, dataSource }, () => next())
+  }
+}
+```
+
+The connection cache is a map of tenant id to TypeORM `DataSource`. Two details are easy to get wrong here, and I would check both in any implementation. Store the promise, so two requests that arrive at the same moment don't both open a pool. And key the map by the full tenant id, never by something derived or shortened from it, such as the database name.
+
+```ts
+@Injectable()
+export class TenantConnections {
+  private readonly pools = new Map<string, Promise<DataSource>>()
+
+  get(tenant: TenantRecord): Promise<DataSource> {
+    let pool = this.pools.get(tenant.id)
+    if (!pool) {
+      pool = new DataSource({
+        type: 'postgres',
+        ...tenant.credentials,
+        entities: TENANT_ENTITIES,
+      }).initialize()
+      this.pools.set(tenant.id, pool)
+    }
+    return pool
+  }
+}
+```
+
+## Carry the tenant through CQRS without passing it around
+
+Once the middleware knows the tenant, every command handler, query handler and repository behind it needs the same `DataSource`. We had three ways to get it there.
+
+Nest's request-scoped providers are built for this. Request scope spreads, though. A request-scoped repository makes every provider that injects it request-scoped too, and in a CQRS app that is nearly everything. Nest would then rebuild most of the app for each request.
+
+We could pass the tenant explicitly: add a parameter to every command, every query, every handler and every repository method. That is the most honest option, and it is a lot of noise. It also does nothing for background jobs, which have no request to take a tenant from.
+
+The third option was Node's `AsyncLocalStorage`, and it is the one we chose. It gives you a store that follows the async call chain. You set it once, and everything that runs inside that chain can read it.
+
+```ts
+import { AsyncLocalStorage } from 'node:async_hooks'
+
+export interface TenantContext {
+  tenantId: string
+  dataSource: DataSource
+}
+
+export const tenantStorage = new AsyncLocalStorage<TenantContext>()
+
+export function currentTenant(): TenantContext {
+  const ctx = tenantStorage.getStore()
+  if (!ctx) throw new Error('No tenant context. Refusing to touch the database.')
+  return ctx
+}
+```
+
+Repositories get their connection from the store and nowhere else:
+
+```ts
+export abstract class TenantRepository<T extends ObjectLiteral> {
+  protected abstract readonly entity: EntityTarget<T>
+
+  protected get repo(): Repository<T> {
+    return currentTenant().dataSource.getRepository(this.entity)
+  }
+}
+
+@Injectable()
+export class DealRepository extends TenantRepository<Deal> {
+  protected readonly entity = Deal
+
+  findById(id: string) {
+    return this.repo.findOneBy({ id })
+  }
+}
+```
+
+Handlers then look like there is no tenancy at all:
+
+```ts
+@QueryHandler(GetDealQuery)
+export class GetDealHandler implements IQueryHandler<GetDealQuery> {
+  constructor(private readonly deals: DealRepository) {}
+
+  execute({ dealId }: GetDealQuery) {
+    return this.deals.findById(dealId)
+  }
+}
+```
+
+That is the whole point. A developer writing a new query handler cannot forget the tenant, because there is nothing to remember. If the code somehow runs with no tenant in the store, the repository throws before it touches a database.
+
+The cost is that the dependency is invisible. You can't tell from a handler's signature that it needs a tenant context. Unit tests have to set up the store or mock the repository. I think that trade is worth it, but it is a real trade.
+
+## Leaving the request: events, sagas and queues
+
+`AsyncLocalStorage` follows the async chain. The moment work leaves that chain, the tenant goes with it. In a CQRS app, work leaves the chain all the time.
+
+The rule I would set, and enforce in code review: **anything that crosses an async boundary carries the tenant id as data.** Events, commands sent from sagas and queue job payloads should all have a `tenantId` field. Nothing downstream should rely on context it happens to inherit. We applied it to queue jobs first, because a job with no tenant has nothing else to go on.
+
+```ts
+export class DealWon {
+  constructor(readonly tenantId: string, readonly dealId: string) {}
+}
+```
+
+On the other side of the boundary, one helper puts the tenant back:
+
+```ts
+@Injectable()
+export class TenantRunner {
+  constructor(
+    private readonly registry: TenantRegistry,
+    private readonly connections: TenantConnections
+  ) {}
+
+  async runAs<T>(tenantId: string, fn: () => Promise<T>): Promise<T> {
+    const tenant = await this.registry.findActive(tenantId)
+    if (!tenant) throw new Error(`Unknown or inactive tenant: ${tenantId}`)
+
+    const dataSource = await this.connections.get(tenant)
+    return tenantStorage.run({ tenantId: tenant.id, dataSource }, fn)
+  }
+}
+```
+
+The queue worker (BullMQ in our case) wraps every job in it:
+
+```ts
+@Processor('crm')
+export class CrmWorker extends WorkerHost {
+  constructor(private readonly tenants: TenantRunner, private readonly jobs: JobDispatcher) {
+    super()
+  }
+
+  async process(job: Job<{ tenantId?: string }>) {
+    const { tenantId } = job.data
+    if (!tenantId) throw new Error(`Job ${job.id} has no tenantId`)
+
+    return this.tenants.runAs(tenantId, () => this.jobs.handle(job))
+  }
+}
+```
+
+Throw there, and don't catch and log. A job that fails loudly gets retried or lands in the failed list where someone sees it. A swallowed error just disappears.
+
+### The `undefined` trap
+
+This one is easy to miss. Here is the registry lookup:
+
+```ts
+findActive(tenantId: string) {
+  return this.repo.findOneBy({ id: tenantId, status: 'active' })
+}
+```
+
+Now suppose a job was published without a `tenantId`, so it arrives as `undefined`. TypeORM 0.3 drops `undefined` values from a `where` object. The query becomes "find one active tenant", and it returns whichever row Postgres gives back first. The job then runs against a real tenant's database. It just isn't the right one.
+
+The fix is one boring line, and it belongs at the top of anything that resolves a tenant:
+
+```ts
+findActive(tenantId: string) {
+  if (!tenantId) throw new Error('tenantId is required')
+  return this.repo.findOneBy({ id: tenantId, status: 'active' })
+}
+```
+
+Newer TypeORM releases also have an `invalidWhereValuesBehavior` option on the data source, which makes an `undefined` in a `where` throw instead of being dropped. Turn it on if your version has it, and keep the guard anyway.
+
+## Where tenant context still slips out
+
+Moving isolation into the connection removes the biggest class of leak. It doesn't remove all of them. These are the ones I would look for in any system built this way.
+
+### `enterWith` instead of `run`
+
+`AsyncLocalStorage` has two ways to set a store. `run(store, fn)` sets it for `fn` and everything `fn` starts, then restores the old value. `enterWith(store)` sets it for the rest of the current execution, with no end.
+
+`enterWith` is tempting in Express-style middleware, because you just call it and then call `next()`. The risk is that the store outlives the request. Any code that shares that execution context afterwards, such as a pooled resource, a long-lived stream or a callback registered somewhere global, can pick up the last tenant that passed through. Use `run(store, () => next())`, and I would make `enterWith` a lint error so nobody reaches for it later:
+
+```js
+// .eslintrc.js
+'no-restricted-properties': [
+  'error',
+  { property: 'enterWith', message: 'Use tenantStorage.run() so the tenant cannot outlive its scope.' },
+],
+```
+
+### Saga streams
+
+A `@nestjs/cqrs` saga is an RxJS pipe over one event stream shared by every tenant. When a saga does async work inside the pipe, for example `concatMap(async (e) => this.queryBus.execute(...))`, that work runs in whatever async context the stream happens to be in. With `concatMap`, a queued event can start from the tail of the previous event's promise. That previous event may have belonged to another tenant.
+
+Don't trust inherited context inside a saga. Re-enter it from the event:
+
+```ts
+@Saga()
+syncSearch = (events$: Observable<IEvent>) =>
+  events$.pipe(
+    ofType(ContactUpdated),
+    concatMap((e) =>
+      this.tenants.runAs(e.tenantId, () => this.queryBus.execute(new FindDealsForContact(e.contactId))),
+    ),
+    map((dealIds) => new ReindexDeals(dealIds)),
+  )
+```
+
+Better still, keep sagas pure. Map an event to a command or a queued job that carries `tenantId`, and do the database work in the handler.
+
+### Cache keys without a tenant
+
+With one database per tenant, `user:42` is a perfectly good cache key inside each database. It is a terrible key in a Redis instance that every tenant shares. TypeORM's query result cache is a good example: if you give it an identifier, that identifier is the whole key. Whatever tenant filled the cache first wins.
+
+Build every shared cache key through one helper so there is no other way to write one:
+
+```ts
+export const tenantKey = (...parts: string[]) => `t:${currentTenant().tenantId}:${parts.join(':')}`
+
+this.repo.createQueryBuilder('u').where('u.id = :id', { id }).cache(tenantKey('user', id), 60_000)
+```
+
+The same goes for anything else keyed by a random id, such as generated PDFs or export files. Store the tenant with the object and check it when someone fetches it. A hard-to-guess UUID is not access control.
+
+### Trusting the header over the token
+
+The tenant header comes from the client. The JWT also says which tenant the user belongs to. If nothing compares the two, a user from tenant A can send tenant B's id and see what happens. With one database per tenant, the user lookup usually fails and the request is rejected. "Usually" is doing a lot of work in that sentence. A shared cache, as described above, or an id that happens to exist in both databases can let it through.
+
+Add a guard that runs after authentication and compares them:
+
+```ts
+@Injectable()
+export class TenantMatchesToken implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const user = ctx.switchToHttp().getRequest().user
+    if (!user || user.tenantId !== currentTenant().tenantId) {
+      throw new ForbiddenException('Token was issued for a different tenant')
+    }
+    return true
+  }
+}
+```
+
+### An exception that is built but never thrown
+
+```ts
+if (!tenantId) {
+  new BadRequestException('Tenant is required')
+}
+```
+
+This compiles, passes review at a glance, and does nothing. The request carries on with no tenant. The repository throw saves you here, which is exactly why that throw exists. TypeScript ESLint's `no-unused-expressions` rule catches this pattern, so turn it on.
+
+### Shared search indexes
+
+Our Postgres data is split by tenant, but a search index usually isn't. If every tenant's documents go into one Elasticsearch index with a `tenant_id` field, you are back to the `WHERE` clause problem, just in a different system. Either give each tenant its own index or filtered alias, or route every search through one client wrapper that adds the tenant filter itself and gives callers no way to skip it.
+
+## Inside one tenant: branches
+
+Tenant isolation separates agencies from each other. Inside one agency there is a second boundary: a staff member at one branch should not see another branch's pipeline, and some roles should only see records they created or are assigned to.
+
+That rule is about rows, not routes. A Nest guard sees the request and the user, but it can't see which of three thousand contacts the user is allowed to read. RLS could express it, but it needs the user's permissions set on the database session, which runs into the same pooled-connection problem as before. So the user's permissions travel with the loaded user, and each list query adds its own branch and assignee conditions to the SQL.
+
+It works, and it keeps the list queries fast, but be clear about how it fails: a new read endpoint that forgets the scoping returns every row in the tenant to every user, with no error. That is the "forgot the `WHERE`" problem again, one level down. It is contained to one tenant, but it still needs its own tests.
+
+## The test I would write first
+
+None of the design above means anything until a test tries to break it. The most useful one takes a few minutes to write: two tenants, the same ids in both, and a user from one asking for the other's data.
+
+```ts
+describe('tenant isolation', () => {
+  const id = randomUUID()
+
+  beforeAll(async () => {
+    await seedDeal(tenantA, { id, title: 'belongs to A' })
+    await seedDeal(tenantB, { id, title: 'belongs to B' })
+  })
+
+  it('serves A its own row', async () => {
+    const res = await api.get(`/deals/${id}`).set(auth(userA)).set('x-tenant-id', tenantA.id)
+    expect(res.body.title).toBe('belongs to A')
+  })
+
+  it('refuses A a token-mismatched request for B', async () => {
+    const res = await api.get(`/deals/${id}`).set(auth(userA)).set('x-tenant-id', tenantB.id)
+    expect(res.status).toBe(403)
+  })
+})
+```
+
+Then extend it to the places that leave the request. Run the same request twice so the second one comes from cache. Publish an event for A and one for B back to back, and check which database each saga touched. Enqueue a job with no `tenantId` and assert that it fails. Most of the pitfalls above would show up in a test like this.
+
+## The checklist
+
+If you are building tenancy into a NestJS CQRS app, this is what I would check:
+
+- The tenant is decided by the connection, or failing that, by one enforcement point that no query can skip.
+- The tenant is resolved once, at the edge, and a missing or inactive tenant is an error.
+- The tenant in the token must match the tenant in the request.
+- Repositories read the tenant from `AsyncLocalStorage` and throw when it is missing.
+- Context is set with `run()`, never `enterWith()`, and a lint rule enforces it.
+- Events, saga commands and job payloads carry `tenantId` as data.
+- Workers and sagas re-enter context from that data instead of inheriting it.
+- Anything that resolves a tenant rejects `undefined` before it reaches the ORM.
+- Every shared cache key and search query goes through a helper that adds the tenant.
+- A two-tenant test with overlapping ids runs in CI.
+
+The design that makes a forgotten `WHERE` clause harmless did most of the work for us. The rest is plumbing, and it is never quite finished: making sure the tenant arrives everywhere the work goes, and failing loudly when it doesn't.

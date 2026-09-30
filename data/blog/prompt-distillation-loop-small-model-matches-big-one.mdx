@@ -1,0 +1,462 @@
+---
+title: 'Prompt Distillation: Teach a Small Model to Match a Big One, in a Loop'
+date: '2026-09-24'
+tags: ['LLM', 'Prompt Engineering', 'Evaluation', 'Distillation', 'AI Engineering']
+draft: true
+summary: "You prototyped with a frontier model and it works. Now the bill scales with traffic and you want a cheaper model to give the same answers. Prompt distillation is how I get there without hand-tuning for weeks. The big model writes the reference answers, a deterministic scorer and a set of narrow judges grade the small model, a fixer rewrites the prompt as a new version, and a loop repeats until the student matches. This post covers the method, the code, how to build the gold set everything is scored against and how that one set unlocks silver, synthetic and fine-tuning data, plus the theory that decides whether it works at all: capacity gaps, noise, judge bias, context dilution, and when to stop prompting and fine-tune."
+images: []
+layout: PostSimple
+---
+
+Most LLM features start the same way. You write a prompt, point it at the biggest model you can afford, and it works. Then it ships, traffic grows, and the model line becomes the largest number on the invoice.
+
+The obvious move is a smaller, cheaper model. The obvious problem is that the small model doesn't give the same answers. So you start editing the prompt by hand. Add a rule, run ten examples, squint at the output, add another rule. Two weeks later the prompt is four times longer and you can't say whether it improved.
+
+This post replaces that by-hand loop with an automated one. I call the method **prompt distillation**: distil the big model's behaviour into a prompt that a small model can follow, using the big model as the teacher and a loop that rewrites, versions and re-scores the prompt until the student matches. No weights change. The artefact is a text file.
+
+It sits in a family with knowledge distillation, automated prompt optimisation and LLM-as-judge evaluation, and it inherits the failure modes of all three. I'll cover the mechanics first and the theory where it changes a decision.
+
+<TOCInline toc={props.toc} />
+
+---
+
+## 🎯 Teacher, Student, Loop
+
+Three roles:
+
+- **Teacher.** The frontier model. It produces reference answers once, and it never runs in production.
+- **Student.** The small model plus a prompt. This is what ships.
+- **The loop.** Runs the student against the references, works out what's wrong, rewrites the prompt, bumps the version, tries again.
+
+The running example is turning a research abstract into a structured study record:
+
+```json
+{
+  "design": "rct",
+  "sample_size": 412,
+  "population": "adults with type 2 diabetes",
+  "intervention": "12-week supervised resistance training",
+  "comparator": "usual care",
+  "primary_outcome": "HbA1c at 12 weeks",
+  "effect": "favours_intervention",
+  "follow_up_months": 6
+}
+```
+
+It's a good test case because it mixes the things that go wrong differently: enums (`design`, `effect`), numbers that must be read and not computed (`sample_size`), and free text that has to be paraphrase-tolerant (`population`). Any domain with that mix behaves the same.
+
+### Why this is distillation, and why it has a ceiling
+
+Classical knowledge distillation trains a student network on a teacher's soft outputs, so the student learns the teacher's uncertainty as well as its answers. Prompt distillation is the cheap cousin: the teacher's behaviour is transferred as **hard labels plus an explicit specification** that lives in the context window rather than the weights.
+
+That has a consequence worth stating up front. A prompt can only elicit behaviour the student already has capacity for. It can fix the student's priorities, its output format and its handling of edge cases. It cannot give it knowledge it lacks or reasoning depth it doesn't have. So before the loop starts, measure the **capacity gap**: score the teacher and the student on the same gold set with the same prompt. The teacher's score is the ceiling. If the student with the best prompt you can find stays far below it, the answer is a fine-tune or a bigger student, and the loop will just tell you that slowly. I'll come back to the point where you make that call.
+
+---
+
+## 🥇 Step 1: The Gold Set
+
+Everything else in this post is machinery. The gold set is the thing the machinery points at, and most loops that fail, fail here.
+
+### What a gold set is
+
+A **gold set** is a small collection of input and correct-output pairs where a human has signed every output. That signature is the whole definition. A model can draft the answer, a script can check it, but until a person has read the input and confirmed the output, it isn't gold.
+
+It's worth naming the tiers, because the loop treats them differently:
+
+| Tier | Who produced the label | What it's for |
+|---|---|---|
+| **Gold** | Human-signed, versioned | The only thing versions are scored against |
+| **Hold-out** | Gold the loop never sees | The honest number at the end |
+| **Candidate** | Teacher-drafted, awaiting review | Becomes gold only after qualification |
+| **Silver** | Model-labelled, never reviewed | Volume: monitoring, fine-tuning, sampling |
+
+A good gold set has five properties. It's **correct**, obviously. It's **stable**: versioned, never edited in place, so two scores are comparable only when they name the same gold version. It's **representative**: built from a coverage matrix, not a random sample. It's **small enough to review** and **large enough to measure**: 40 to 80 items plus a hold-out is where paired comparisons start to have power, and where a human can still read every one. And it has **provenance**: where the input came from, who signed the output, when, and against which version of the annotation guide.
+
+### How to build one
+
+**1. Write the contract before labelling anything.** The schema says what fields exist. It doesn't say what "correct" means when the abstract reports 412 randomised and 388 analysed, or when a three-arm trial has two comparators. An **annotation guide** does. Write it as a short rulebook with one worked example per ambiguous case, and version it. Without it, two annotators disagree, and your score measures the annotators instead of the model.
+
+**2. Sample by coverage, not by chance.** Draw a matrix. Rows are the variants that break extraction differently: each `design` value, abstracts with no stated sample size, negative and null results, multi-arm trials, follow-up stated in weeks rather than months, results reported only as relative risk. Columns are the counts you want. Fill every cell, and over-fill the ones that are rare in traffic but expensive when wrong. The loop optimises for whatever the gold set contains, so the gold set has to contain what you care about.
+
+```python:coverage.py
+STRATA = {
+    "design": ["rct", "cohort", "case_control", "cross_sectional", "meta_analysis"],
+    "sample_size_stated": [True, False],
+    "effect": ["favours_intervention", "favours_comparator", "no_difference", "not_reported"],
+    "arms": ["two", "three_plus"],
+}
+MIN_PER_CELL = 4
+
+def coverage_gaps(gold: list[dict]) -> list[tuple[str, str]]:
+    gaps = []
+    for axis, values in STRATA.items():
+        for v in values:
+            n = sum(1 for g in gold if g["strata"][axis] == v)
+            if n < MIN_PER_CELL:
+                gaps.append((axis, str(v)))
+    return gaps
+```
+
+Run that before the loop, and again whenever you add items. A gap in the matrix is a blind spot the loop will never report.
+
+**3. Let the teacher draft.** Run the frontier model over every input and keep its output as `draft.json`. This is the cheap step. Drafting by hand is slow and no more accurate.
+
+```python:make_gold.py
+import json, pathlib, litellm
+
+TEACHER = "your-frontier-model"
+SCHEMA = json.load(open("schema.json"))
+
+def teacher_draft(abstract: str) -> dict:
+    resp = litellm.completion(
+        model=TEACHER,
+        messages=[
+            {"role": "system", "content": open("prompts/teacher.txt").read()},
+            {"role": "user", "content": abstract},
+        ],
+        response_format={"type": "json_schema",
+                         "json_schema": {"name": "study", "schema": SCHEMA}},
+        temperature=0,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+for item in pathlib.Path("gold/v1").iterdir():
+    draft = teacher_draft((item / "input.md").read_text())
+    (item / "draft.json").write_text(json.dumps(draft, indent=2))
+```
+
+**4. A human signs every draft into `actual.json`.** Show the input and the draft side by side, correct the draft, save the result as a separate file, and commit it. Code never writes `actual.json` again. Two things fall out of this step for free. First, the **diff between draft and actual is the teacher's error profile**, and where the teacher struggles, the student will struggle more. Save those diffs. Second, every correction the annotator makes that the guide didn't cover is a missing rule in the guide. Add it before the next item.
+
+**5. Qualify before promoting.** A candidate becomes gold when it passes a qualification gate, and that gate is separate from the version scorer. Schema validity is the floor. Then cross-field checks the schema can't express: a follow-up shorter than the intervention, a comparator on a single-arm study, an effect direction on a study with no outcome. Then agreement: on a subset, have a second annotator label blind and measure how often they match. Items with persistent disagreement are not hard items, they're **holes in the guide**. Fix the guide and re-label; don't pick a winner.
+
+```python:qualify.py
+def qualify(item: dict, guide_version: str) -> tuple[bool, list[str]]:
+    reasons = []
+    if not schema_valid(item["actual"]):
+        reasons.append("schema")
+    reasons += cross_field_violations(item["actual"])     # rules the schema cannot express
+    if item.get("second_label") and item["second_label"] != item["actual"]:
+        reasons.append("annotator_disagreement")
+    if item["signed_against_guide"] != guide_version:
+        reasons.append("stale_guide")
+    return not reasons, reasons
+```
+
+**6. Freeze it, version it, split it.** `gold/v1/` is immutable. Adding items makes `gold/v2/`, with a changelog line saying what was added and why. Split the hold-out at creation time, by stratum, so both halves cover the matrix. Record the gold version in every score report, because a mean of 63 on gold v1 and 63 on gold v2 are not the same number.
+
+That's the expensive part of the whole method, and it's the part that transfers. Every model you evaluate for the next two years will be scored against this set.
+
+---
+
+## 🗂️ Step 2: Prompts Are Immutable, Versioned Files
+
+Every prompt change is a new file. Nothing is edited after it exists.
+
+```
+prompts/extract/
+├── v1.txt
+├── v2.txt
+├── v2.changes.json
+├── v3.txt
+└── v3.changes.json
+```
+
+This feels like ceremony until the first regression, when you need to know which change broke things and to run the old version again in one command. It also makes the loop **bisectable**: a bad version is a file you can diff, not an edit somebody half-remembers.
+
+The resolver is tiny. Explicit argument beats environment variable beats highest file on disk:
+
+```python:prompts.py
+import os, re, pathlib
+
+ROOT = pathlib.Path("prompts")
+
+def resolve_version(name: str, explicit: int | None = None) -> int:
+    if explicit is not None:
+        return explicit
+    if env := os.getenv(f"{name.upper()}_VERSION"):
+        return int(env)
+    return max(int(m.group(1)) for p in (ROOT / name).glob("v*.txt")
+               if (m := re.fullmatch(r"v(\d+)\.txt", p.name)))
+
+def load_prompt(name: str, version: int | None = None) -> tuple[int, str]:
+    v = resolve_version(name, version)
+    return v, (ROOT / name / f"v{v}.txt").read_text()
+```
+
+The highest-on-disk fallback is convenient in the loop and dangerous in production. Hold that thought.
+
+---
+
+## 📏 Step 3: A Deterministic Scorer, and an Honest Noise Floor
+
+You need one number per item, and it must be deterministic. An LLM can't be the scorer, because then a change in the score might be a change in the judge.
+
+Score per field, weight what matters, be explicit about absent values, and give partial credit where the field allows it:
+
+```python:score.py
+WEIGHTS = {"design": 15, "sample_size": 15, "population": 10, "intervention": 10,
+           "comparator": 10, "primary_outcome": 10, "effect": 15, "follow_up_months": 5}
+MAX_SCORE = sum(WEIGHTS.values())  # 90
+
+def field_score(field: str, expected, actual) -> float:
+    if expected is None and actual is None:
+        return 1.0
+    if expected is None or actual is None:
+        return 0.0
+    if field in ("design", "effect", "sample_size", "follow_up_months"):
+        return 1.0 if expected == actual else 0.0             # exact: enums and read numbers
+    return token_f1(expected, actual)                          # free text: paraphrase-tolerant
+
+def score(expected: dict, actual: dict) -> float:
+    return sum(w * field_score(f, expected.get(f), actual.get(f)) for f, w in WEIGHTS.items())
+```
+
+Two properties of your scorer you must measure before you trust it.
+
+**The floor.** If absent-on-both-sides counts as a match, an empty output isn't zero. Run `score(expected, {})` across the gold set and record the mean. The pass mark has to sit far above that floor, or a prompt that returns nothing will pass. On this schema, an empty record already scores whatever weight the optional fields carry.
+
+**The noise.** Temperature 0 is not determinism. Batched inference, mixture-of-experts routing and floating-point reduction order all produce run-to-run variation, and some providers change quietly under a fixed model name. So run the *same* prompt on the *same* gold set twice, and look at the per-item differences. That spread is your noise, and a version that improves by less than it hasn't improved.
+
+Which leads to how you compare versions. Don't compare means. Compare **paired differences**: for each gold item, score under vN and vN+1, take the difference, and bootstrap a confidence interval on the mean difference. The pairing cancels item difficulty, which is most of the variance. A version is better when the interval excludes zero, not when the mean is higher.
+
+```python:compare.py
+import random
+
+def paired_ci(a: dict, b: dict, n_boot: int = 2000) -> tuple[float, float, float]:
+    diffs = [b[k] - a[k] for k in a]                 # same items, same order
+    boots = sorted(sum(random.choices(diffs, k=len(diffs))) / len(diffs) for _ in range(n_boot))
+    return sum(diffs) / len(diffs), boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot)]
+```
+
+A fixer that reads "mean went from 61.2 to 61.9" as progress will chase noise forever. Give it the interval instead.
+
+---
+
+## 🔍 Step 4: Narrow Judges, Grounded in Evidence
+
+The score says *that* an item is wrong. To rewrite the prompt you need *why*, and a number can't say.
+
+The first thing everyone tries is one judge with "review this output and list the problems". It fails for reasons the LLM-as-judge literature has catalogued: it invents a new taxonomy each run, it prefers longer outputs, it's swayed by the order things are shown in, and if the judge is from the same family as the model being judged, it's kinder to that model's style. None of that can be counted, so none of it can drive a loop.
+
+What works is several **narrow judges**, each hunting one failure class, each with a fixed severity ladder, each required to quote the input:
+
+- **fabricated values**: a sample size or follow-up that the abstract doesn't state
+- **missed data**: a stated comparator left null
+- **computed instead of read**: `sample_size` summed from arm sizes when the abstract gives the total
+- **wrong enum**: `design: "rct"` for an observational study with a control group
+- **effect direction flipped**: the classic one, where "no significant difference" becomes `favours_intervention`
+
+```python:judge.py
+JUDGE_TEMPLATE = """You check ONE thing: {failure_class}.
+Definition: {definition}
+
+Severity:
+  ERROR   = {error_rule}
+  WARNING = {warning_rule}
+  INFO    = anything else worth recording
+
+Every finding MUST include a verbatim quote from the input as evidence.
+A finding without a quote is invalid.
+Return JSON: {{"findings": [{{"severity": "...", "field": "...", "evidence": "...", "note": "..."}}]}}
+Return an empty list if you find nothing. Report nothing outside your failure class."""
+```
+
+Three details make this hold up.
+
+**The quote requirement is a grounding check, not decoration.** After the judge returns, verify that `evidence` is a substring of the input. If it isn't, drop the finding. That single check removes most hallucinated findings, because a judge that invents a problem usually can't quote support for it.
+
+**Calibrate the judges once.** Hand-label the findings on a dozen items and measure each judge's precision. A judge with 60% precision is generating work for the fixer that will make the prompt worse. Tighten its definition or its severity rule until precision is high, even at the cost of recall. In a loop, a false ERROR is more expensive than a missed one, because the fixer acts on it.
+
+**Only ERROR drives the loop.** Warnings go to a human. Info is an audit trail. If everything is an error, the loop never stops.
+
+---
+
+## ✍️ Step 5: The Fixer Is a Textual Gradient
+
+The fixer replaces you editing prompts at midnight. It's a call that receives the current prompt, the consolidated ERROR findings with their quotes, and a few failing inputs, and writes the next version.
+
+It helps to see what this is. In gradient descent, the loss tells you *how wrong* and the gradient tells you *which way to move*. Here the scorer is the loss and the judges' findings are the gradient, expressed in natural language. Automated prompt optimisation has explored this space from several angles: OPRO has the model propose new prompts from a history of prompt-score pairs, DSPy compiles prompts by searching over instructions and few-shot demonstrations against a metric, and TextGrad makes the "textual gradient" idea explicit, backpropagating natural-language feedback through a pipeline. This loop is the engineering-flavoured relative: evidence-grounded edits, immutable versions, a human-signed gold set, and a budget.
+
+The fixer's instructions matter more than anything else here, because a careless fixer makes prompts longer, not better:
+
+```python:fixer.py
+FIXER_SYSTEM = """You improve an extraction prompt for a SMALL model. You receive the current prompt and
+a list of ERROR findings, each with a verbatim quote from a real input.
+
+Rules:
+1. Change only what the findings justify. Add no rule for a problem that was not reported.
+2. For each pattern, prefer one worked example over three abstract rules. Small models
+   follow demonstrations better than they follow constraints.
+3. If an existing rule caused the error, rewrite that rule. Never add a second rule that
+   contradicts the first.
+4. The new prompt must not be longer than the current one unless a finding cannot be
+   fixed otherwise. If you add, consolidate elsewhere.
+5. Output the full new prompt, then a JSON block listing each change:
+   pattern, action, evidence_count."""
+
+def write_next_version(name: str, current: int, findings: list[dict], examples: list[str]) -> int:
+    v, prompt = load_prompt(name, current)
+    resp = litellm.completion(
+        model=TEACHER,   # the fixer may be the frontier model: it runs a handful of times, not per request
+        messages=[{"role": "system", "content": FIXER_SYSTEM},
+                  {"role": "user", "content": render(prompt, findings, examples)}],
+        temperature=0,
+    )
+    new_prompt, changes = split_prompt_and_changes(resp.choices[0].message.content)
+    nxt = v + 1
+    (ROOT / name / f"v{nxt}.txt").write_text(new_prompt)
+    (ROOT / name / f"v{nxt}.changes.json").write_text(json.dumps(
+        {"previous_version": v, "new_version": nxt, "changes": changes}, indent=2))
+    return nxt
+```
+
+Rule 4 is there because of **context dilution**. Small models degrade faster than large ones as the instruction block grows: attention spreads over more rules, the ones in the middle get less of it, and a worked example buried on line 180 does less than one on line 20. The failure mode this produces is distinctive. The fixer sees five findings, adds seventy lines of rules, and the student gets *worse at everything else*. When the prompt still grows across iterations, add a consolidation pass that asks the fixer to merge and shorten before it's allowed to add.
+
+The `changes.json` sidecar is the other thing I'd insist on. Six versions in, it's the only way to answer "why does the prompt say this?" without diffing two 200-line files.
+
+---
+
+## 🔁 Step 6: The Loop, With a Budget and a Memory
+
+```python:loop.py
+MAX_ITER = 5
+
+def run_loop(student: str, name: str = "extract") -> dict:
+    version = resolve_version(name)
+    prev_scores, best = None, {"version": None, "mean": -1.0}
+
+    for i in range(1, MAX_ITER + 1):
+        outputs = extract_all(student, name, version)                 # student, prompt vN
+        scores = {k: score(gold[k], outputs[k]) for k in gold}
+        mean = sum(scores.values()) / len(scores)
+        findings = [f for f in run_judges(outputs) if grounded(f)]   # quote must appear in input
+        errors = [f for f in findings if f["severity"] == "ERROR"]
+
+        improved = prev_scores is None or paired_ci(prev_scores, scores)[1] > 0
+        log(i, version, mean, len(errors), improved)
+        if mean > best["mean"] and improved:
+            best = {"version": version, "mean": mean}
+
+        if not errors:
+            break
+        version = write_next_version(name, version, errors, failing_inputs(scores))
+        prev_scores = scores
+
+    holdout = mean_score(student, name, best["version"], HOLDOUT)
+    write_json(f"best_config_{student}.json", {
+        "model": student, "prompt_version": best["version"],
+        "gold_mean": best["mean"], "holdout_mean": holdout, "temperature": 0,
+    })
+    return best
+```
+
+An example run, for shape only:
+
+```
+iter 1  v3  mean 51.2/90  errors 23  improved n/a
+iter 2  v4  mean 58.9/90  errors  9  improved yes
+iter 3  v5  mean 63.4/90  errors  2  improved yes
+iter 4  v6  mean 60.1/90  errors  4  improved no    <- v6 stays on disk; best stays v5
+iter 5  v7  mean 64.0/90  errors  0  improved yes   <- done; holdout scored on v7
+```
+
+Three rules in that code, each learned the expensive way:
+
+- **The loop never deletes a version.** A regressed version stays on disk with its sidecar. That's the record of what didn't work, and the fixer can be shown it next time.
+- **Newest is not best.** The fixer bumps the version whether or not the result improved, so the highest file on disk means nothing. `best_config_<model>.json` is the only file that says which version won, and it's per model, because a prompt tuned to one student's habits doesn't transfer to another.
+- **There's a budget.** Five iterations, then stop and write down what's stuck. An uncapped loop will spend a night adding rules for one stubborn item.
+
+### Constrained decoding changes which errors you see
+
+Use the provider's JSON-schema mode or a grammar-constrained decoder for the student. It guarantees syntax, and it deletes a whole class of findings: malformed JSON, unknown enum values, strings where integers belong. What it can't do is semantics. The decoder will happily emit `"design": "rct"` for a cohort study because `rct` is a legal token. So once constraints are on, your judges should stop looking for format errors entirely and spend their budget on meaning. If a judge is still reporting enum-format findings after you've turned constraints on, it's miscalibrated.
+
+### Reasoning budgets are a knob, not a fixed cost
+
+If the student is a reasoning model, its thinking tokens are billed as output, usually at several times the input rate, and on an extraction task they can be most of the bill. Extraction rarely needs long chains of thought, so set the reasoning budget low and check the score. Then check it **per field**. Ambiguous fields, such as effect direction in a three-arm trial, may genuinely benefit from thinking, while reading a sample size does not. If the split is sharp, a two-tier design pays: a low-reasoning pass for the easy fields and a second call, only on flagged items, with more budget. The loop handles that fine, because the prompt for each tier is just another versioned file.
+
+---
+
+## 🧬 From One Gold Set to Every Other Dataset
+
+The gold set is expensive, so it's tempting to stop at one. Don't. Once a signed gold set exists, it becomes the reference that makes every cheaper dataset trustworthy enough to use. This is where the method starts paying back.
+
+**Silver sets: volume without review.** When the loop converges, run the student over the unlabelled backlog and store the outputs as silver. Silver is never scored against, and it never enters the gold mean. It's for the jobs that need volume: watching field distributions over time to catch drift, building fine-tuning data, and giving you a population to sample from. Tag every silver record with the prompt version and model that produced it, so it can be discarded when they change.
+
+**Disagreement sampling: growing gold where it matters.** You now have two labellers you can afford to run at scale, the teacher and the converged student. Run both over a silver slice and keep the items where they disagree. Those are, almost by construction, the inputs your gold set didn't cover, and they're the cheapest candidates you'll ever find. Review them, qualify them, promote them to `gold/v2`. This is active learning with a very simple acquisition function, and it grows the gold set toward the errors instead of toward the average.
+
+```python:sample_candidates.py
+def disagreement_candidates(silver: list[dict], teacher_out: dict, student_out: dict, k: int = 30):
+    scored = [(score(teacher_out[i["id"]], student_out[i["id"]]), i) for i in silver]
+    scored.sort(key=lambda t: t[0])                      # lowest agreement first
+    return [item for _, item in scored[:k]]
+```
+
+**Synthetic variants: testing robustness with known answers.** Each gold item can spawn perturbed inputs whose correct output you can derive without a human: delete the sentence that states the sample size and the answer's `sample_size` becomes null; swap the arm order and the answer is unchanged; change every number by a fixed offset and the numeric fields follow. These test whether the student is reading or pattern-matching. Keep them in a separate tier, score them separately, and never let them into the gold mean, because a synthetic item that's too easy inflates the score and one that's malformed punishes the model for your bug.
+
+**Judge calibration sets: gold with injected errors.** Take gold items, inject one known error of each class into the output, and run the judges. Now you know each judge's precision and recall against ground truth, which is the calibration step from Step 4 done properly. Re-run it whenever a judge prompt or the judge model changes.
+
+**A regression suite for everything after this.** Gold plus hold-out plus the synthetic tier is a test suite. Any prompt change, any model swap, any provider update gets scored against it before it ships, with the paired comparison from Step 3 as the pass rule. Most teams never build this, and they find out about regressions from users.
+
+**Fine-tuning data, when you get there.** If the loop plateaus below the teacher and you decide to distil into weights, the training set is silver filtered to items where teacher and student already agree, plus the gold set held back as validation. The judges become the acceptance test for the tuned model. Nothing from the loop is thrown away.
+
+**A new schema or domain reuses the process, not the data.** The annotation guide template, the coverage-matrix check, the qualification gate, the tiering and the versioning all carry across. The items don't. Expect to spend the same effort on the second gold set as the first, and less time being surprised.
+
+---
+
+## 🪤 Where It Goes Wrong
+
+**Goodhart, always.** The fixer optimises the number you gave it. If free-text fields use token overlap, the fixer will learn to make the student copy longer spans, which raises the overlap and lowers the usefulness. Check the hold-out, read twenty outputs by hand every few iterations, and keep the judges independent of the scorer.
+
+**Overfitting the gold set.** Every iteration sees the same inputs, and a fixer will happily write a rule that only fixes item 17. The tell is a rising gold score with a flat hold-out. When that shows up, stop the loop and fix the gold set's coverage rather than the prompt.
+
+**Confusing prompt drift with model drift.** Providers update models under stable names. When a pinned version's score moves with no prompt change, re-run the noise measurement before you blame anything. Keep the teacher's drafts and the scored outputs for each version so that question is answerable later.
+
+**Production quietly picks up a new version.** That highest-on-disk fallback in the resolver: if production uses it, the next fixer run changes production behaviour on the next deploy. Pin the version in production config from `best_config`, and treat an unpinned prompt as a bug.
+
+**Caching flatters the wrong variant.** Providers discount repeated prompt prefixes. A long prompt with a cached prefix can look cheaper in your bill than a short one that isn't, so compare versions at list price first and cache-inclusive second. Your production hit rate decides which number is real for you.
+
+**Thinking the loop replaces reading.** It replaces squinting, not judgement. Someone still owns the gold set, the judge calibration and the decision to stop.
+
+---
+
+## 🧭 When to Stop Prompting and Fine-Tune
+
+Come back to the capacity gap. After a converged loop you have four numbers: the teacher on gold, the student's best on gold, the student's best on hold-out, and the cost per item for each. Plot cost against score and you have a small Pareto frontier. The version to ship is the cheapest point whose score is within your measured noise of the teacher's.
+
+If no such point exists, and the loop has plateaued for two iterations with errors that the fixer keeps failing to remove, the gap is capacity, not instruction. That's the signal to distil into weights instead of into a prompt: fine-tune the student on the teacher-drafted, human-corrected records you already built. Everything from this loop carries over. The gold set is the training and validation data, the scorer is the training metric, the judges are the regression suite, and the versioned prompts become a much shorter system prompt for the tuned model. The loop wasn't wasted. It built the evaluation harness that a fine-tune needs and most teams never get around to building.
+
+---
+
+## ✅ The Checklist
+
+1️⃣ **Measure the capacity gap first.** Teacher and student, same prompt, same gold set.
+
+2️⃣ **Build the gold set properly.** Annotation guide first, coverage matrix, teacher drafts, human signs `actual.json`, qualification gate, versioned and frozen, hold-out split by stratum.
+
+3️⃣ **Immutable versioned prompts**, each with a `changes.json`.
+
+4️⃣ **A deterministic scorer** with a measured floor and a measured noise level; compare versions by paired differences, not means.
+
+5️⃣ **Narrow judges** with one failure class, a severity ladder, and a verified quote per finding. Calibrate their precision.
+
+6️⃣ **A fixer told to change only what the evidence supports** and to keep the prompt from growing.
+
+7️⃣ **A capped loop** that keeps every version and records `best_config_<model>.json`.
+
+8️⃣ **Grow from gold.** Silver for volume, disagreement sampling to find the next gold candidates, synthetic variants and injected-error sets kept in their own tiers.
+
+9️⃣ **Constrained decoding on**, judges pointed at semantics.
+
+🔟 **Reasoning budget set per task**, checked per field.
+
+1️⃣1️⃣ **Pinned versions in production**, one config per model, cost measured at list price and cache-inclusive.
+
+---
+
+## Conclusion 🌱
+
+The by-hand version of this is a person adding rules to a prompt and squinting at outputs. The automated version is the same thing with the squinting replaced by a scorer and a set of grounded judges, the person replaced by a fixer with strict rules, and every attempt kept as a numbered file so the history can be read.
+
+> The big model is the teacher, the small model is the student, and the prompt is the lesson. The loop rewrites the lesson until the student passes, and tells you honestly when it never will.
+
+Build the scorer and the judges first. They are what make the loop honest, and they're the part you keep long after this year's models are gone.
